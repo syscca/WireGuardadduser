@@ -155,6 +155,22 @@ list_users() {
     echo "------------------------------------------------------------"
 }
 
+view_user_config() {
+    read -p "请输入要查看配置的用户名: " username
+    config_file="/etc/wireguard/${username}.conf"
+    
+    if [ ! -f "$config_file" ]; then
+        echo "错误：用户 $username 的配置文件不存在"
+        return 1
+    fi
+    
+    echo "-----------------------------------------------"
+    echo "用户 $username 的配置文件内容："
+    cat "$config_file"
+    echo "-----------------------------------------------"
+    qrencode -t ansiutf8 < "$config_file"
+}
+
 show_menu() {
     clear
     echo "WireGuard 服务器管理脚本增强版"
@@ -163,9 +179,10 @@ show_menu() {
     echo "2. 添加VPN用户"
     echo "3. 删除VPN用户"
     echo "4. 显示现有用户"
-    echo "5. 卸载WireGuard"
-    echo "6. 系统状态检查"
-    echo "7. 退出"
+    echo "5. 查看用户配置"
+    echo "6. 卸载WireGuard"
+    echo "7. 系统状态检查"
+    echo "8. 退出"
     echo ""
 }
 
@@ -202,9 +219,10 @@ case "$1" in
                 2) check_root; add_user ;;
                 3) check_root; remove_user ;;
                 4) list_users ;;
-                5) check_root; uninstall_wireguard ;;
-                6) system_check ;;
-                7) exit 0 ;;
+                5) check_root; view_user_config ;;
+                6) check_root; uninstall_wireguard ;;
+                7) system_check ;;
+                8) exit 0 ;;
                 *) echo "无效选项";;
             esac
             read -p "按回车键继续..."
