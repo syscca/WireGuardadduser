@@ -172,16 +172,16 @@ show_menu() {
 system_check() {
     echo "系统状态检查："
     echo "-----------------------------------------------"
-    # 检查IP转发状态
     check_forwarding && echo "IP转发状态: 已启用" || echo "IP转发状态: 未启用"
-    
-    # 检查BBR状态
     check_bbr && echo "BBR加速状态: 已启用" || echo "BBR加速状态: 未启用"
     
-    # 检查WireGuard服务状态
     if systemctl is-active --quiet wg-quick@wg0; then
-        echo "WireGuard服务状态: 运行中"
-        wg show wg0 brief
+        echo -e "WireGuard服务状态: 运行中\n当前连接状态："
+        wg show wg0 | awk '
+            BEGIN {print "客户端ID          最近握手              传输数据"}
+            /peer:/ {peer=substr($2,0,20)}
+            /latest handshake:/ {handshake=$3" "$4}
+            /transfer:/ {printf "%-18s %-20s %s %s\n", peer, handshake, $2, $3}'
     else
         echo "WireGuard服务状态: 未运行"
     fi
