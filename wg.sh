@@ -1,263 +1,217 @@
 #!/bin/bash
-# WireGuard 服务器管理脚本增强版
-# 支持Debian 12系统
+# WireGuard 服务器管理脚本
+# 支持：Debian 12
+# 功能：安装/卸载、用户管理、套餐计费、自动维护
 
 CONFIG_FILE="/etc/wireguard/wg0.conf"
-SERVER_IP="10.0.0.1/24"
-SERVER_PORT="51820"
-DNS_SERVERS="8.8.8.8"
-SERVER_PUBKEY=""
-SERVER_PRIVKEY=""
-INTERFACE_NAME=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-[ -z "$INTERFACE_NAME" ] && INTERFACE_NAME="eth0"
+USER_DB="/etc/wireguard/wg_users.json"
+LOG_FILE="/var/log/wg_manager.log"
 
+# 初始化日志记录
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# 检查root权限
 check_root() {
-    [ "$EUID" -ne 0 ] && echo "请使用root权限运行此脚本" && exit 1
+    if [ "$EUID" -ne 0 ]; then
+        echo "请使用root权限运行此脚本"
+        exit 1
+    fi
 }
 
-check_forwarding() {
-    [ "$(sysctl -n net.ipv4.ip_forward)" -eq 0 ] && return 1
-    return 0
+# 自动获取公网IP
+get_public_ip() {
+    PUBLIC_IP=$(curl -4 -s ifconfig.me)
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(hostname -I | awk '{print $1}')
+    echo "$PUBLIC_IP"
 }
 
-check_bbr() {
-    sysctl net.ipv4.tcp_congestion_control | grep -q bbr
-    return $?
+# 自动检测默认网卡
+get_default_interface() {
+    DEFAULT_IFACE=$(ip route | awk '/default/ {print $5}' | head -n1)
+    echo "$DEFAULT_IFACE"
 }
 
-enable_bbr() {
-    grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+# 系统优化配置
+enable_sysctl() {
+    SYSCTL_CONF="/etc/sysctl.conf"
+    # 开启转发
+    if ! grep -q "net.ipv4.ip_forward=1" "$SYSCTL_CONF"; then
+        echo "net.ipv4.ip_forward=1" >> "$SYSCTL_CONF"
+    fi
+    
+    # 开启BBR
+    if ! grep -q "net.core.default_qdisc=fq" "$SYSCTL_CONF"; then
+        echo "net.core.default_qdisc=fq" >> "$SYSCTL_CONF"
+    fi
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" "$SYSCTL_CONF"; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> "$SYSCTL_CONF"
+    fi
+    
     sysctl -p >/dev/null 2>&1
 }
 
+# 安装WireGuard
 install_wireguard() {
-    apt update && apt upgrade -y
-    apt install -y wireguard-tools resolvconf qrencode
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "WireGuard 已经安装"
+        return
+    fi
+
+    apt update >/dev/null 2>&1
+    apt install -y wireguard qrencode jq >/dev/null 2>&1
 
     # 生成服务器密钥
     umask 077
     wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
-    SERVER_PRIVKEY=$(cat /etc/wireguard/privatekey)
-    SERVER_PUBKEY=$(cat /etc/wireguard/publickey)
+
+    # 初始化用户数据库
+    [ ! -f "$USER_DB" ] && echo "{}" > "$USER_DB"
 
     # 创建配置文件
     cat > "$CONFIG_FILE" <<EOF
 [Interface]
-Address = $SERVER_IP
-ListenPort = $SERVER_PORT
-PrivateKey = $SERVER_PRIVKEY
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $INTERFACE_NAME -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $INTERFACE_NAME -j MASQUERADE
+Address = 10.10.0.1/24
+SaveConfig = true
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $(get_default_interface) -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $(get_default_interface) -j MASQUERADE
+ListenPort = 51820
+PrivateKey = $(cat /etc/wireguard/privatekey)
 EOF
 
-    # 启用IP转发
-    if ! check_forwarding; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        sysctl -p
-    fi
-
-    # 启用BBR
-    if ! check_bbr; then
-        enable_bbr
-        echo "已启用BBR加速"
-    fi
-
-    systemctl enable --now wg-quick@wg0
-    systemctl status wg-quick@wg0 --no-pager
+    # 启用服务
+    systemctl enable --now wg-quick@wg0 >/dev/null 2>&1
+    enable_sysctl
+    log "WireGuard 安装完成"
 }
 
+# 卸载WireGuard
 uninstall_wireguard() {
-    systemctl stop wg-quick@wg0
-    systemctl disable wg-quick@wg0
-    apt remove --purge -y wireguard-tools
-    rm -rf /etc/wireguard/
-    sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf
-    sysctl -p
-    echo "WireGuard 已完全卸载"
+    systemctl stop wg-quick@wg0 >/dev/null 2>&1
+    apt remove --purge -y wireguard >/dev/null 2>&1
+    rm -rf /etc/wireguard
+    log "WireGuard 已卸载"
 }
 
+# 添加用户
 add_user() {
     read -p "请输入用户名: " username
-    client_ip="10.0.0.$((2 + $(grep -c '^\[Peer\]' "$CONFIG_FILE" 2>/dev/null)))/32"
-    
-    # 生成客户端密钥和PSK
-    umask 077
-    wg genkey | tee "/etc/wireguard/${username}_privatekey" | wg pubkey > "/etc/wireguard/${username}_publickey"
-    wg genpsk > "/etc/wireguard/${username}.psk"
-    client_privkey=$(cat "/etc/wireguard/${username}_privatekey")
-    client_pubkey=$(cat "/etc/wireguard/${username}_publickey")
-    client_psk=$(cat "/etc/wireguard/${username}.psk")
+    read -p "选择套餐 (1)月付 2)年付: " plan
 
-    # 添加到服务器配置
-    cat >> "$CONFIG_FILE" <<EOF
+    # 生成密钥
+    user_private=$(wg genkey)
+    user_public=$(echo "$user_private" | wg pubkey)
+    user_ip="10.10.0.$((2 + $(jq length "$USER_DB")))
+    expire_days=$([ "$plan" == "2" ] && echo "365" || echo "30")
 
-[Peer]
-PublicKey = $client_pubkey
-PresharedKey = $client_psk
-AllowedIPs = $client_ip
-EOF
+    # 更新用户数据库
+    jq --arg user "$username" \
+       --arg pub "$user_public" \
+       --arg ip "$user_ip" \
+       --arg expire "$(date -d "+${expire_days} days" +%Y-%m-%d)" \
+       '. + { ($user): { "public_key": $pub, "ip": $ip, "expire": $expire } }' \
+       "$USER_DB" > tmp.json && mv tmp.json "$USER_DB"
+
+    # 更新WireGuard配置
+    echo -e "\n[Peer]" >> "$CONFIG_FILE"
+    echo "PublicKey = $user_public" >> "$CONFIG_FILE"
+    echo "AllowedIPs = $user_ip/32" >> "$CONFIG_FILE"
+    wg addconf wg0 <(wg-quick strip wg0)
 
     # 生成客户端配置
-    cat > "/etc/wireguard/${username}.conf" <<EOF
+    cat > "/root/wg-client-$username.conf" <<EOF
 [Interface]
-PrivateKey = $client_privkey
-Address = $client_ip
-DNS = $DNS_SERVERS
+PrivateKey = $user_private
+Address = $user_ip/24
+DNS = 8.8.8.8
 
 [Peer]
-PublicKey = $SERVER_PUBKEY
-PresharedKey = $client_psk
-Endpoint = $(curl -4 ifconfig.co):$SERVER_PORT
+PublicKey = $(cat /etc/wireguard/publickey)
+Endpoint = $(get_public_ip):51820
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    wg syncconf wg0 <(wg-quick strip wg0)
-    echo "用户 $username 添加成功"
-    qrencode -t ansiutf8 < "/etc/wireguard/${username}.conf"
+    qrencode -t ansiutf8 < "/root/wg-client-$username.conf"
+    log "用户 $username 已添加，有效期至: $(date -d "+${expire_days} days" +%Y-%m-%d)"
 }
 
-remove_user() {
-    read -p "请输入要删除的用户名: " username
-    
-    if [ ! -f "/etc/wireguard/${username}_publickey" ]; then
-        echo "用户不存在!"
-        return 1
-    fi
-
-    client_pubkey=$(cat "/etc/wireguard/${username}_publickey")
-    sed -i "/PublicKey = $client_pubkey/,+3d" "$CONFIG_FILE"
-    rm -f "/etc/wireguard/${username}"*
-    wg syncconf wg0 <(wg-quick strip wg0)
-    echo "用户 $username 已删除"
-}
-
-list_users() {
-    echo "当前用户列表："
-    echo "------------------------------------------------------------"
-    printf "%-15s %-25s %-18s %-10s\n" "用户名" "公钥" "IP地址" "PSK状态"
-    
-    while read -r line; do
-        if [[ $line =~ \[Peer\] ]]; then
-            unset pubkey psk ip
-        elif [[ $line =~ PublicKey\ =\ (.+) ]]; then
-            pubkey=${BASH_REMATCH[1]}
-        elif [[ $line =~ PresharedKey\ =\ (.+) ]]; then
-            psk="已启用"
-        elif [[ $line =~ AllowedIPs\ =\ (.+)/32 ]]; then
-            ip=${BASH_REMATCH[1]}
-            user=$(find /etc/wireguard -name "*_publickey" -exec grep -l "$pubkey" {} \; | xargs basename | sed 's/_publickey//')
-            [ -z "$psk" ] && psk="未启用"
-            printf "%-15s %-25s %-18s %-10s\n" "$user" "${pubkey:0:20}..." "$ip" "$psk"
-        fi
-    done < "$CONFIG_FILE"
-    echo "------------------------------------------------------------"
-}
-
-view_user_config() {
-    # 获取所有用户列表
-    users=()
-    while read -r line; do
-        if [[ $line =~ \[Peer\] ]]; then
-            unset pubkey
-        elif [[ $line =~ PublicKey\ =\ (.+) ]]; then
-            pubkey=${BASH_REMATCH[1]}
-        elif [[ $line =~ AllowedIPs\ =\ (.+)/32 ]]; then
-            user=$(find /etc/wireguard -name "*_publickey" -exec grep -l "$pubkey" {} \; | xargs basename | sed 's/_publickey//')
-            users+=("$user")
-        fi
-    done < "$CONFIG_FILE"
-
-    # 显示用户列表
-    echo "现有用户："
-    for i in "${!users[@]}"; do
-        echo "$((i+1)). ${users[$i]}"
+# 删除用户
+del_user() {
+    users=$(jq -r 'keys[]' "$USER_DB")
+    select username in $users; do
+        [ -z "$username" ] && exit
+        
+        public_key=$(jq -r ".$username.public_key" "$USER_DB")
+        sed -i "/PublicKey = $public_key/,+2d" "$CONFIG_FILE"
+        jq "del(.$username)" "$USER_DB" > tmp.json && mv tmp.json "$USER_DB"
+        wg addconf wg0 <(wg-quick strip wg0)
+        rm -f "/root/wg-client-$username.conf"
+        log "用户 $username 已删除"
+        break
     done
-
-    # 处理空列表
-    if [ ${#users[@]} -eq 0 ]; then
-        echo "错误：没有可用的用户"
-        return 1
-    fi
-
-    # 用户选择
-    read -p "请输入要查看的用户编号 [1-${#users[@]}]: " num
-    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#users[@]} ]; then
-        echo "无效的编号"
-        return 1
-    fi
-
-    username="${users[$((num-1))]}"
-    config_file="/etc/wireguard/${username}.conf"
-    
-    if [ ! -f "$config_file" ]; then
-        echo "错误：用户 $username 的配置文件不存在"
-        return 1
-    fi
-    
-    echo "-----------------------------------------------"
-    echo "用户 $username 的配置文件内容："
-    cat "$config_file"
-    echo "-----------------------------------------------"
-    qrencode -t ansiutf8 < "$config_file"
 }
 
-show_menu() {
-    clear
-    echo "WireGuard 服务器管理脚本增强版"
-    echo "-----------------------------------------------"
-    echo "1. 安装WireGuard服务器"
-    echo "2. 添加VPN用户"
-    echo "3. 删除VPN用户"
-    echo "4. 显示现有用户"
-    echo "5. 查看用户配置"
-    echo "6. 卸载WireGuard"
-    echo "7. 系统状态检查"
-    echo "8. 退出"
-    echo ""
-}
-
-system_check() {
-    echo "系统状态检查："
-    echo "-----------------------------------------------"
-    check_forwarding && echo "IP转发状态: 已启用" || echo "IP转发状态: 未启用"
-    check_bbr && echo "BBR加速状态: 已启用" || echo "BBR加速状态: 未启用"
+# 到期检查
+check_expire() {
+    today=$(date +%Y-%m-%d)
+    expired_users=$(jq -r "to_entries[] | select(.value.expire < \"$today\") | .key" "$USER_DB")
     
-    if systemctl is-active --quiet wg-quick@wg0; then
-        echo -e "WireGuard服务状态: 运行中\n当前连接状态："
-        wg show wg0 | awk '
-            BEGIN {print "客户端ID          最近握手              传输数据"}
-            /peer:/ {peer=substr($2,0,20)}
-            /latest handshake:/ {handshake=$3" "$4}
-            /transfer:/ {printf "%-18s %-20s %s %s\n", peer, handshake, $2, $3}'
-    else
-        echo "WireGuard服务状态: 未运行"
-    fi
-    echo "-----------------------------------------------"
+    for user in $expired_users; do
+        public_key=$(jq -r ".$user.public_key" "$USER_DB")
+        sed -i "/PublicKey = $public_key/,+2d" "$CONFIG_FILE"
+        jq "del(.$user)" "$USER_DB" > tmp.json && mv tmp.json "$USER_DB"
+        log "用户 $user 已过期，自动删除"
+    done
 }
 
+# 主菜单
+main_menu() {
+    check_root
+    check_expire
+
+    PS3='请选择操作: '
+    options=("安装WireGuard" "卸载WireGuard" "添加用户" "删除用户" "退出")
+    
+    select opt in "${options[@]}"
+    do
+        case $opt in
+            "安装WireGuard")
+                install_wireguard
+                ;;
+            "卸载WireGuard")
+                uninstall_wireguard
+                ;;
+            "添加用户")
+                add_user
+                ;;
+            "删除用户")
+                del_user
+                ;;
+            "退出")
+                break
+                ;;
+            *) echo "无效选项";;
+        esac
+    done
+}
+
+# 每日自动维护
+auto_maintain() {
+    check_expire
+    systemctl restart wg-quick@wg0
+}
+
+# 执行入口
 case "$1" in
-    install)
-        check_root
+    "install")
         install_wireguard
         ;;
+    "auto")
+        auto_maintain
+        ;;
     *)
-        while true; do
-            show_menu
-            read -p "请输入选项 [1-7]: " choice
-            case $choice in
-                1) check_root; install_wireguard ;;
-                2) check_root; add_user ;;
-                3) check_root; remove_user ;;
-                4) list_users ;;
-                5) check_root; view_user_config ;;
-                6) check_root; uninstall_wireguard ;;
-                7) system_check ;;
-                8) exit 0 ;;
-                *) echo "无效选项";;
-            esac
-            read -p "按回车键继续..."
-        done
+        main_menu
         ;;
 esac
