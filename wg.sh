@@ -159,7 +159,8 @@ remove_user() {
     fi
 
     client_pubkey=$(cat "/etc/wireguard/${username}_publickey")
-    sed -i "/PublicKey = $client_pubkey/,+3d" "$CONFIG_FILE"
+    client_pubkey_escaped=$(echo "$client_pubkey" | sed 's/\//\\\//g')  # 转义斜杠
+    sed -i "/PublicKey = $client_pubkey_escaped/,+3d" "$CONFIG_FILE"
     rm -f "/etc/wireguard/${username}"*
     wg syncconf wg0 <(wg-quick strip wg0)
     echo "用户 $username 已删除"
