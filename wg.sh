@@ -119,7 +119,7 @@ EOF
 }
 
 remove_user() {
-    # 获取所有用户列表
+    # 获取用户列表
     users=()
     while read -r line; do
         if [[ $line =~ \[Peer\] ]]; then
@@ -138,13 +138,11 @@ remove_user() {
         echo "$((i+1)). ${users[$i]}"
     done
 
-    # 处理空列表
     if [ ${#users[@]} -eq 0 ]; then
         echo "错误：没有可用的用户"
         return 1
     fi
 
-    # 用户选择
     read -p "请输入要删除的用户编号 [1-${#users[@]}]: " num
     if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt ${#users[@]} ]; then
         echo "无效的编号"
@@ -159,10 +157,30 @@ remove_user() {
     fi
 
     client_pubkey=$(cat "/etc/wireguard/${username}_publickey")
-    client_pubkey_escaped=$(echo "$client_pubkey" | sed 's/\//\\\//g')  # 转义斜杠
-    sed -i "/PublicKey = $client_pubkey_escaped/,+3d" "$CONFIG_FILE"
+    client_pubkey_escaped=$(echo "$client_pubkey" | sed 's/\//\\\//g')
+
+    # 备份配置
+    cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
+
+    # 删除整个 [Peer] 块（含空行）
+    sed -i "/PublicKey = $client_pubkey_escaped/,/^$/d" "$CONFIG_FILE"
+
+    # 清理密钥文件
     rm -f "/etc/wireguard/${username}"*
-    wg syncconf wg0 <(wg-quick strip wg0)
+
+    # 强制重置服务
+    sudo systemctl stop wg-quick@wg0
+    sudo ip link delete dev wg0 2>/dev/null
+    sudo systemctl start wg-quick@wg0
+
+    # 验证配置
+    if ! sudo wg-quick check wg0; then
+        echo "错误：配置文件无效，正在回滚..."
+        cp "$CONFIG_FILE.bak" "$CONFIG_FILE"
+        sudo systemctl restart wg-quick@wg0
+        exit 1
+    fi
+
     echo "用户 $username 已删除"
 }
 
