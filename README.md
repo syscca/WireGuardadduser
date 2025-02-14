@@ -1,0 +1,2 @@
+# WireGuardadduser
+WireGuard安装卸载用户管理脚本
