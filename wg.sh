@@ -143,6 +143,11 @@ EOF
 
     systemctl restart wg-quick@wg0
     echo -e "\n${GREEN}客户端配置已创建：${NC}"
+    echo -e "\n${GREEN}客户端配置文件路径：${YELLOW}$client_dir/wg0-client.conf${NC}"
+    echo -e "${BLUE}=== 客户端配置内容 ===${NC}"
+    cat "$client_dir/wg0-client.conf"
+    
+    echo -e "\n${GREEN}使用以下二维码扫码导入配置：${NC}"
     qrencode -t ansiutf8 < "$client_dir/wg0-client.conf"
 }
 
@@ -182,14 +187,47 @@ list_users() {
         return
     fi
 
-    echo -e "${YELLOW}已创建的用户列表：${NC}"
-    i=1
-    for user_dir in "${users[@]}"; do
-        client_name=$(basename "$user_dir")
-        ip=$(grep Address "$user_dir/wg0-client.conf" | awk '{print $3}')
-        echo -e "${BLUE}$i. $client_name ($ip)${NC}"
-        ((i++))
+    echo -e "${YELLOW}=== 用户列表（选择数字查看详情） ===${NC}"
+    PS3="请输入要查看的用户编号（0返回主菜单）: "
+    select user_dir in "${users[@]}" "返回"; do
+        case $REPLY in
+            0 | $((${#users[@]}+1)) )
+                break
+                ;;
+            [1-9]*) 
+                if [ -n "$user_dir" ] && [ "$user_dir" != "返回" ]; then
+                    show_client_config "$user_dir"
+                else
+                    echo -e "${RED}无效选择${NC}"
+                fi
+                ;;
+            *)
+                echo -e "${RED}无效输入${NC}"
+                ;;
+        esac
     done
+}
+
+# 新增的配置展示函数
+show_client_config() {
+    clear
+    local user_dir=$1
+    local client_name=$(basename "$user_dir")
+    
+    echo -e "${YELLOW}=== 客户端配置详情 ===${NC}"
+    echo -e "${BLUE}用户名：${GREEN}$client_name${NC}"
+    echo -e "${BLUE}配置文件：${YELLOW}$user_dir/wg0-client.conf${NC}"
+    echo -e "${BLUE}创建时间：${GREEN}$(stat -c %y "$user_dir/wg0-client.conf")\n${NC}"
+    
+    echo -e "${YELLOW}=== 配置内容 ===${NC}"
+    cat "$user_dir/wg0-client.conf"
+    
+    echo -e "\n${YELLOW}=== 二维码（使用WireGuard客户端扫码） ===${NC}"
+    qrencode -t ansiutf8 < "$user_dir/wg0-client.conf"
+    
+    echo -e "\n${GREEN}按回车键返回用户列表...${NC}"
+    read
+    list_users
 }
 
 # 主菜单
