@@ -1,263 +1,234 @@
 #!/bin/bash
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # 恢复默认颜色
+# 检查 root 权限
+if [ "$(id -u)" != "0" ]; then
+    echo "错误：此脚本必须以 root 权限运行。"
+    exit 1
+fi
 
-# 配置文件路径
-WG_CONF="/etc/wireguard/wg0.conf"
-SERVER_PRIVATE_KEY="/etc/wireguard/privatekey"
-SERVER_PUBLIC_KEY="/etc/wireguard/publickey"
+CONFIG_FILE="/etc/wireguard/wg0.conf"
 CLIENT_DIR="/etc/wireguard/clients"
+SERVER_IP_RANGE="10.10.0.1/24"
 
-# 获取公网IP
+# 获取公网 IP
 get_public_ip() {
-    PUBLIC_IP=$(curl -s myip.ipip.net | grep -o "[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}")
+    PUBLIC_IP=$(curl -s myip.ipip.net | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}')
+    if [ -z "$PUBLIC_IP" ]; then
+        echo "无法自动获取公网 IP，请手动输入"
+        read -p "请输入服务器公网 IP: " PUBLIC_IP
+    fi
     echo "$PUBLIC_IP"
 }
 
-# 检查root权限
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}错误：必须使用root权限运行此脚本${NC}"
-        exit 1
-    fi
-}
-
-# 检查系统状态
-check_status() {
-    # 检查BBR
-    echo -e "${YELLOW}=== BBR状态检查 ===${NC}"
-    sysctl net.ipv4.tcp_congestion_control | grep -q "bbr" && \
-        echo -e "${GREEN}BBR 已启用${NC}" || \
-        echo -e "${RED}BBR 未启用${NC}"
-
-    # 检查IP转发
-    echo -e "\n${YELLOW}=== IP转发状态 ===${NC}"
-    sysctl net.ipv4.ip_forward | grep -q "1" && \
-        echo -e "${GREEN}IP转发 已启用${NC}" || \
-        echo -e "${RED}IP转发 未启用${NC}"
-
-    # 检查WireGuard状态
-    echo -e "\n${YELLOW}=== WireGuard 服务状态 ===${NC}"
-    if systemctl is-active --quiet wg-quick@wg0; then
-        echo -e "${GREEN}WireGuard 正在运行${NC}"
-        wg show
+# 检查 BBR
+check_bbr() {
+    if sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
+        echo "✅ BBR 已启用"
     else
-        echo -e "${RED}WireGuard 未运行${NC}"
+        echo "❌ BBR 未启用"
     fi
 }
 
-# 启用BBR和转发
-enable_features() {
-    # 启用BBR
-    if ! sysctl net.ipv4.tcp_congestion_control | grep -q "bbr"; then
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-        sysctl -p
-    fi
-
-    # 启用IP转发
-    if ! sysctl net.ipv4.ip_forward | grep -q "1"; then
-        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-        sysctl -p
+# 检查转发
+check_forward() {
+    if [ "$(sysctl -n net.ipv4.ip_forward)" -eq 1 ]; then
+        echo "✅ IP 转发已启用"
+    else
+        echo "❌ IP 转发未启用"
     fi
 }
 
-# 安装WireGuard
-install_wireguard() {
-    check_root
-    apt update && apt install -y wireguard qrencode
-    
-    mkdir -p "$CLIENT_DIR"
+# 安装 WireGuard
+install_wg() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "WireGuard 已经安装！"
+        return 1
+    fi
+
+    echo "正在安装 WireGuard..."
+    apt update
+    apt install -y wireguard resolvconf
+
+    # 生成密钥
     umask 077
-    
-    # 生成服务器密钥
-    wg genkey | tee "$SERVER_PRIVATE_KEY" | wg pubkey > "$SERVER_PUBLIC_KEY"
-    
+    wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+
     # 创建配置文件
-    cat > "$WG_CONF" <<EOF
+    echo "正在创建配置文件..."
+    PRIVATE_KEY=$(cat /etc/wireguard/privatekey)
+    PUBLIC_IP=$(get_public_ip)
+    INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+    cat > "$CONFIG_FILE" <<EOF
 [Interface]
-PrivateKey = $(cat "$SERVER_PRIVATE_KEY")
-Address = 10.0.0.1/24
+PrivateKey = $PRIVATE_KEY
+Address = $SERVER_IP_RANGE
 ListenPort = 51820
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $(ip route get 8.8.8.8 | awk '/dev/ {print $5}') -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $(ip route get 8.8.8.8 | awk '/dev/ {print $5}') -j MASQUERADE
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $INTERFACE -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $INTERFACE -j MASQUERADE
 EOF
 
-    enable_features
-    systemctl enable --now wg-quick@wg0
+    # 启用转发和 BBR
+    echo "启用系统参数..."
+    sed -i '/net.ipv4.ip_forward=1/s/^#//g' /etc/sysctl.conf
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1
+
+    systemctl enable --now wg-quick@wg0 >/dev/null 2>&1
+    echo "✅ WireGuard 安装完成"
 }
 
-# 卸载WireGuard
-uninstall_wireguard() {
-    check_root
+# 卸载 WireGuard
+uninstall_wg() {
     systemctl stop wg-quick@wg0
     systemctl disable wg-quick@wg0
-    apt remove --purge -y wireguard
-    rm -rf /etc/wireguard
-    echo -e "${GREEN}WireGuard 已完全卸载${NC}"
+    apt remove -y wireguard
+    rm -rf /etc/wireguard/*
+    echo "✅ WireGuard 已卸载"
 }
 
 # 添加用户
 add_user() {
-    check_root
-    read -p "请输入客户端名称: " client_name
-    client_dir="$CLIENT_DIR/$client_name"
-    mkdir -p "$client_dir"
+    [ ! -f "$CONFIG_FILE" ] && echo "请先安装 WireGuard！" && return 1
+
+    # 获取下一个可用 IP
+    LAST_IP=$(grep AllowedIPs "$CONFIG_FILE" | awk '{print $3}' | cut -d'/' -f1 | sort -t . -k 4 -n | tail -n1)
+    CLIENT_IP=${LAST_IP:-10.10.0.2}
+    NEXT_IP=$(echo $CLIENT_IP | awk -F. '{printf "%d.%d.%d.%d", $1,$2,$3,$4+1}')
 
     # 生成密钥
-    wg genkey | tee "$client_dir/privatekey" | wg pubkey > "$client_dir/publickey"
-    wg genpsk > "$client_dir/presharedkey"
+    CLIENT_PRIVATE=$(wg genkey)
+    CLIENT_PUBLIC=$(echo "$CLIENT_PRIVATE" | wg pubkey)
+    CLIENT_PSK=$(wg genpsk)
 
-    # 获取下一个可用IP
-    last_ip=$(grep Address "$WG_CONF" | awk '{print $3}' | cut -d/ -f1 | sort -t . -k 4 -n | tail -n1)
-    next_ip=${last_ip%.*}.$(( ${last_ip##*.} + 1 ))
-
-    # 更新服务器配置
-    cat >> "$WG_CONF" <<EOF
+    # 添加到服务器配置
+    cat >> "$CONFIG_FILE" <<EOF
 
 [Peer]
-PublicKey = $(cat "$client_dir/publickey")
-PresharedKey = $(cat "$client_dir/presharedkey")
-AllowedIPs = $next_ip/32
+PublicKey = $CLIENT_PUBLIC
+AllowedIPs = $NEXT_IP/32
+PresharedKey = $CLIENT_PSK
 EOF
 
-    # 生成客户端配置
-    cat > "$client_dir/wg0-client.conf" <<EOF
+    # 创建客户端配置
+    mkdir -p "$CLIENT_DIR"
+    SERVER_PUBLIC=$(cat /etc/wireguard/publickey)
+    PUBLIC_IP=$(get_public_ip)
+
+    cat > "${CLIENT_DIR}/client_$NEXT_IP.conf" <<EOF
 [Interface]
-PrivateKey = $(cat "$client_dir/privatekey")
-Address = $next_ip/24
+PrivateKey = $CLIENT_PRIVATE
+Address = $NEXT_IP/32
 DNS = 8.8.8.8
 
 [Peer]
-PublicKey = $(cat "$SERVER_PUBLIC_KEY")
-PresharedKey = $(cat "$client_dir/presharedkey")
-EndPoint = $(get_public_ip):51820
-AllowedIPs = 0.0.0.0/0, ::/0
+PublicKey = $SERVER_PUBLIC
+Endpoint = $PUBLIC_IP:51820
+AllowedIPs = 0.0.0.0/0
+PresharedKey = $CLIENT_PSK
 PersistentKeepalive = 25
 EOF
 
-    systemctl restart wg-quick@wg0
-    echo -e "\n${GREEN}客户端配置已创建：${NC}"
-    echo -e "\n${GREEN}客户端配置文件路径：${YELLOW}$client_dir/wg0-client.conf${NC}"
-    echo -e "${BLUE}=== 客户端配置内容 ===${NC}"
-    cat "$client_dir/wg0-client.conf"
-    
-    echo -e "\n${GREEN}使用以下二维码扫码导入配置：${NC}"
-    qrencode -t ansiutf8 < "$client_dir/wg0-client.conf"
+    wg syncconf wg0 <(wg-quick strip wg0)
+    echo "✅ 用户添加成功"
+    echo "客户端配置文件: ${CLIENT_DIR}/client_$NEXT_IP.conf"
 }
 
 # 删除用户
-delete_user() {
-    check_root
-    users=("$CLIENT_DIR"/*)
-    if [ ${#users[@]} -eq 0 ]; then
-        echo -e "${RED}没有可删除的用户${NC}"
-        return
-    fi
+del_user() {
+    [ ! -f "$CONFIG_FILE" ] && echo "请先安装 WireGuard！" && return 1
 
-    echo -e "${YELLOW}请选择要删除的用户：${NC}"
-    select user_dir in "${users[@]}"; do
-        if [ -n "$user_dir" ]; then
-            client_name=$(basename "$user_dir")
-            public_key=$(cat "$user_dir/publickey")
-            
-            # 从服务器配置中删除
-            sed -i "/PublicKey = $public_key/,+3d" "$WG_CONF"
-            
-            rm -rf "$user_dir"
-            systemctl restart wg-quick@wg0
-            echo -e "${GREEN}用户 $client_name 已删除${NC}"
-            break
-        else
-            echo -e "${RED}无效选择${NC}"
-        fi
+    PEERS=($(grep -A4 '\[Peer\]' "$CONFIG_FILE" | grep AllowedIPs | awk '{print $3}'))
+    [ ${#PEERS[@]} -eq 0 ] && echo "没有可删除的用户！" && return
+
+    echo "请选择要删除的用户："
+    for i in "${!PEERS[@]}"; do
+        echo "$((i+1)). ${PEERS[$i]}"
     done
+
+    read -p "请输入编号: " NUM
+    [ -z "$NUM" ] && return
+    SELECTED="${PEERS[$((NUM-1))]}"
+
+    # 删除配置
+    awk -v ip="${SELECTED/\//\\/}" '
+    BEGIN {RS=""; FS="\n"}
+    {
+        if ($0 !~ "AllowedIPs.*"ip) {
+            print $0
+        }
+    }' "$CONFIG_FILE" > /tmp/wg0.tmp && mv /tmp/wg0.tmp "$CONFIG_FILE"
+
+    # 删除客户端文件
+    CLIENT_IP=$(echo "$SELECTED" | cut -d'/' -f1)
+    rm -f "${CLIENT_DIR}/client_$CLIENT_IP.conf"
+
+    wg syncconf wg0 <(wg-quick strip wg0)
+    echo "✅ 用户已删除"
 }
 
-# 查看用户
-list_users() {
-    users=("$CLIENT_DIR"/*)
-    if [ ${#users[@]} -eq 0 ]; then
-        echo -e "${RED}没有可用用户${NC}"
-        return
-    fi
+# 查看配置
+list_config() {
+    [ ! -d "$CLIENT_DIR" ] && echo "没有客户端配置！" && return
 
-    echo -e "${YELLOW}=== 用户列表（选择数字查看详情） ===${NC}"
-    PS3="请输入要查看的用户编号（0返回主菜单）: "
-    select user_dir in "${users[@]}" "返回"; do
-        case $REPLY in
-            0 | $((${#users[@]}+1)) )
-                break
-                ;;
-            [1-9]*) 
-                if [ -n "$user_dir" ] && [ "$user_dir" != "返回" ]; then
-                    show_client_config "$user_dir"
-                else
-                    echo -e "${RED}无效选择${NC}"
-                fi
-                ;;
-            *)
-                echo -e "${RED}无效输入${NC}"
-                ;;
+    FILES=($(ls ${CLIENT_DIR}/*.conf 2>/dev/null))
+    [ ${#FILES[@]} -eq 0 ] && echo "没有客户端配置！" && return
+
+    echo "请选择要查看的配置："
+    for i in "${!FILES[@]}"; do
+        echo "$((i+1)). $(basename ${FILES[$i]})"
+    done
+
+    read -p "请输入编号: " NUM
+    [ -z "$NUM" ] && return
+    clear
+    cat "${FILES[$((NUM-1))]}"
+}
+
+# 系统状态
+system_status() {
+    echo "------ 系统状态 ------"
+    check_bbr
+    check_forward
+    echo ""
+    echo "------ WireGuard 状态 ------"
+    systemctl status wg-quick@wg0 --no-pager
+    echo ""
+    echo "------ 当前用户数 ------"
+    grep -c '\[Peer\]' "$CONFIG_FILE"
+}
+
+# 菜单
+menu() {
+    while true; do
+        clear
+        echo "================================="
+        echo " WireGuard 管理脚本 (Debian 12) "
+        echo "================================="
+        echo "1. 安装 WireGuard"
+        echo "2. 卸载 WireGuard"
+        echo "3. 添加用户"
+        echo "4. 删除用户"
+        echo "5. 查看配置"
+        echo "6. 系统状态"
+        echo "7. 退出"
+        echo "================================="
+        read -p "请输入选项 [1-7]: " OPT
+
+        case $OPT in
+            1) install_wg ;;
+            2) uninstall_wg ;;
+            3) add_user ;;
+            4) del_user ;;
+            5) list_config ;;
+            6) system_status ;;
+            7) exit 0 ;;
+            *) echo "无效选项！"; sleep 1 ;;
         esac
+        read -p "按回车键继续..."
     done
 }
 
-# 新增的配置展示函数
-show_client_config() {
-    clear
-    local user_dir=$1
-    local client_name=$(basename "$user_dir")
-    
-    echo -e "${YELLOW}=== 客户端配置详情 ===${NC}"
-    echo -e "${BLUE}用户名：${GREEN}$client_name${NC}"
-    echo -e "${BLUE}配置文件：${YELLOW}$user_dir/wg0-client.conf${NC}"
-    echo -e "${BLUE}创建时间：${GREEN}$(stat -c %y "$user_dir/wg0-client.conf")\n${NC}"
-    
-    echo -e "${YELLOW}=== 配置内容 ===${NC}"
-    cat "$user_dir/wg0-client.conf"
-    
-    echo -e "\n${YELLOW}=== 二维码（使用WireGuard客户端扫码） ===${NC}"
-    qrencode -t ansiutf8 < "$user_dir/wg0-client.conf"
-    
-    echo -e "\n${GREEN}按回车键返回用户列表...${NC}"
-    read
-    list_users
-}
-
-# 主菜单
-main_menu() {
-    clear
-    echo -e "${YELLOW}=== WireGuard 管理脚本 ===${NC}"
-    echo "1. 安装 WireGuard"
-    echo "2. 卸载 WireGuard"
-    echo "3. 添加用户"
-    echo "4. 删除用户"
-    echo "5. 查看用户"
-    echo "6. 系统状态检查"
-    echo "7. 退出"
-    read -p "请输入选项 [1-7]: " choice
-
-    case $choice in
-        1) install_wireguard ;;
-        2) uninstall_wireguard ;;
-        3) add_user ;;
-        4) delete_user ;;
-        5) list_users ;;
-        6) check_status ;;
-        7) exit 0 ;;
-        *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
-    esac
-
-    read -p "按回车键返回主菜单..."
-    main_menu
-}
-
-# 初始化检查
-[ ! -d "$CLIENT_DIR" ] && mkdir -p "$CLIENT_DIR"
-main_menu
+# 启动菜单
+menu
