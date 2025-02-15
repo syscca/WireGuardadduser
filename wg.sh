@@ -9,6 +9,17 @@ fi
 CONFIG_FILE="/etc/wireguard/wg0.conf"
 CLIENT_DIR="/etc/wireguard/clients"
 SERVER_IP_RANGE="10.10.0.1/24"
+OBFS_PORT=50000  # 默认值，安装时可修改
+UDP2RAW_PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
+
+check_port_available() {
+    local port=$1
+    if ss -tuln | grep -q ":$port "; then
+        echo "错误：端口 $port 已被占用！"
+        return 1
+    fi
+    return 0
+}
 
 # 获取公网 IP
 get_public_ip() {
@@ -45,9 +56,46 @@ install_wg() {
         return 1
     fi
 
-    echo "正在安装 WireGuard..."
+    # 获取自定义端口
+    while true; do
+        read -p "请输入伪装端口（推荐使用常见TCP端口如 80/443/22/25）：" OBFS_PORT
+        if check_port_available $OBFS_PORT; then
+            break
+        fi
+    done
+
+    echo "正在安装必要组件..."
     apt update
     apt install -y wireguard wireguard-tools resolvconf qrencode
+
+    # 安装udp2raw
+    if ! command -v udp2raw &> /dev/null; then
+        echo "正在部署流量混淆组件..."
+        wget https://github.com/wangyu-/udp2raw/releases/download/20200818.0/udp2raw_binaries.tar.gz
+        tar xzf udp2raw_binaries.tar.gz -C /usr/local/bin/ udp2raw_amd64
+        mv /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw
+        chmod +x /usr/local/bin/udp2raw
+        rm udp2raw_binaries.tar.gz
+    fi
+
+    # 配置udp2raw服务
+    cat > /etc/systemd/system/udp2raw.service <<EOF
+[Unit]
+Description=UDP over TCP Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/udp2raw -s -l0.0.0.0:$OBFS_PORT -r 127.0.0.1:51820 --raw-mode faketcp -k "$UDP2RAW_PASSWORD" --cipher-mode xor -a
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启动服务
+    systemctl daemon-reload
+    systemctl enable --now udp2raw
     
     # 修复：强制创建目录并设置权限
     mkdir -p /etc/wireguard
@@ -88,9 +136,15 @@ EOF
 uninstall_wg() {
     systemctl stop wg-quick@wg0
     systemctl disable wg-quick@wg0
+    systemctl stop udp2raw
+    systemctl disable udp2raw
+    
     apt remove -y wireguard
     rm -rf /etc/wireguard/*
-    echo "✅ WireGuard 已卸载"
+    rm -f /usr/local/bin/udp2raw
+    rm -f /etc/systemd/system/udp2raw.service
+    
+    echo "✅ 已完全卸载所有组件"
 }
 
 # 添加用户
@@ -127,9 +181,13 @@ PrivateKey = $CLIENT_PRIVATE
 Address = $NEXT_IP/32
 DNS = 8.8.8.8
 
+# 流量混淆配置（自动生成）
+PostUp = udp2raw -c -l0.0.0.0:2090 -r $PUBLIC_IP:$OBFS_PORT --raw-mode faketcp -k $UDP2RAW_PASSWORD --cipher-mode xor -a &
+PreDown = killall udp2raw
+
 [Peer]
 PublicKey = $SERVER_PUBLIC
-Endpoint = $PUBLIC_IP:51820
+Endpoint = 127.0.0.1:2090
 AllowedIPs = 0.0.0.0/0
 PresharedKey = $CLIENT_PSK
 PersistentKeepalive = 25
