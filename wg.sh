@@ -142,6 +142,8 @@ EOF
     wg syncconf wg0 <(wg-quick strip wg0)
     echo "✅ 用户添加成功"
     echo "客户端配置文件: ${CLIENT_DIR}/client_$NEXT_IP.conf"
+    echo "════════ 配置文件内容 ════════"
+    cat "${CLIENT_DIR}/client_$NEXT_IP.conf"
 }
 
 # 删除用户
