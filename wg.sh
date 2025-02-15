@@ -71,7 +71,7 @@ install_wg() {
     # 安装udp2raw
     if ! command -v udp2raw &> /dev/null; then
         echo "正在部署流量混淆组件..."
-        wget https://github.com/wangyu-/udp2raw/releases/download/20200818.0/udp2raw_binaries.tar.gz
+        wget https://ghfast.top/https://github.com/wangyu-/udp2raw/releases/download/20200818.0/udp2raw_binaries.tar.gz
         tar xzf udp2raw_binaries.tar.gz -C /usr/local/bin/ udp2raw_amd64
         mv /usr/local/bin/udp2raw_amd64 /usr/local/bin/udp2raw
         chmod +x /usr/local/bin/udp2raw
