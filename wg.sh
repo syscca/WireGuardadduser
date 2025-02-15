@@ -47,7 +47,7 @@ install_wg() {
 
     echo "正在安装 WireGuard..."
     apt update
-    apt install -y wireguard wireguard-tools resolvconf
+    apt install -y wireguard wireguard-tools resolvconf qrencode
     
     # 修复：强制创建目录并设置权限
     mkdir -p /etc/wireguard
@@ -134,6 +134,10 @@ AllowedIPs = 0.0.0.0/0
 PresharedKey = $CLIENT_PSK
 PersistentKeepalive = 25
 EOF
+    # 显示二维码（ASCII格式）
+    echo -e "\n════════ 客户端二维码 ════════"
+    qrencode -t ansiutf8 < "${CLIENT_DIR}/client_$NEXT_IP.conf"
+    echo -e "══════════════════════════════\n"
 
     wg syncconf wg0 <(wg-quick strip wg0)
     echo "✅ 用户添加成功"
@@ -187,8 +191,15 @@ list_config() {
 
     read -p "请输入编号: " NUM
     [ -z "$NUM" ] && return
+    SELECTED_FILE="${FILES[$((NUM-1))]}"
+    
     clear
-    cat "${FILES[$((NUM-1))]}"
+    echo "════════ 配置文件内容 ════════"
+    cat "$SELECTED_FILE"
+    
+    echo -e "\n════════ 客户端二维码 ════════"
+    qrencode -t ansiutf8 < "$SELECTED_FILE"
+    echo -e "══════════════════════════════"
 }
 
 # 系统状态
