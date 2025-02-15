@@ -47,9 +47,14 @@ install_wg() {
 
     echo "正在安装 WireGuard..."
     apt update
-    apt install -y wireguard resolvconf
+    apt install -y wireguard wireguard-tools resolvconf
+    
+    # 修复：强制创建目录并设置权限
+    mkdir -p /etc/wireguard
+    chmod 700 /etc/wireguard
 
     # 生成密钥
+    echo "正在生成密钥..."
     umask 077
     wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
 
